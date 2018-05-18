@@ -1,0 +1,387 @@
+---
+title: "320 Final Project"
+author: "Jack Saylor"
+date: "May 1, 2018"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Viral Youtube Video Analysis
+
+## Motivation
+
+[YouTube](http://www.youtube.com) is a massive online video-sharing website. It is almost as pervasive as Google is, in that it is the standard of video hosting on the internet. It started as a way for people to share videos with their friends online but in 13 years it has evolved into a form of new media. Even many notorious television stars are posting their content on youtube because that is where the people are watching videos now.
+
+What's even more interesting is that a few videos will strike a chord with YouTube's audience and go _viral_. For example, Psy's Gangnam Style was the first youtube video to hit 1 billion views. Now the #1 video on the site is Despacito by Luis Fonsi at a staggering 5.1 billion views as of May 2018 (roughly 70% of the world population!).
+
+My interest is exploring what factors lead a video to go viral and how will it be received? (majority liked/disliked or controversial). If we have a better understanding of what types of videos people want to watch then we can better understand the psychology of virality in human culture.
+
+## Data
+
+### Description
+
+The data for this Viral Youtube Video Analyis was found on [kaggle.com](http://www.kaggle.com/datasnaek/youtube/data). Let's first download the data and store it in a place that RStudio can access.
+
+Now, let's open the data and see what it looks like.
+
+```{r}
+library(tidyverse)
+data <- read_csv("USvideos.csv")
+head(data)
+```
+
+Immediately from looking at the data we can see some helpful information. The video_id appears to be the code that you append to the url: "https://www.youtube.com/watch?v=" after the equals sign to get the full url of the video.
+
+Some of the important attributes of videos I want to use are the title, channel_title, category_id, description and tags. Some of the "viral-ness" measures are views, likes, dislikes, comment_total, comments_disabled, ratings_disabled and video_error_or_removed.
+
+Now lets use the given JSON file to translate the category_id into the actual category name for clarity purposes.
+
+```{r}
+library(rjson)
+library(jsonlite)
+json_file <- fromJSON("US_category_id.json",flatten=TRUE)
+category_table <- json_file[[3]] %>%
+  select(category_id=id,category=snippet.title)
+category_table$category_id <- as.integer(category_table$category_id)
+category_table
+```
+
+Now that we have a table that maps category_id to actual categories, lets join this information with the main data table.
+
+```{r}
+full_df <- data %>%
+  left_join(category_table,by="category_id") %>%
+  select(title,channel_title,tags,description,category, views,likes,dislikes,comment_count,comments_disabled,ratings_disabled,video_error_or_removed ,publish_time,category_id)
+full_df
+```
+
+## EDA - Exploratory Data Analysis
+
+Now that we have curated and cleaned our data set lets do some preliminary exploratory data analysis.
+
+First, let's graph views over time and color them by category.
+
+```{r}
+full_df %>%
+  ggplot(mapping=aes(x=publish_time,y=views,color=category)) +
+  geom_point()
+```
+
+Just from looking at this we can see that there seems to be some faulty data that still needs cleaning. It looks like there are outliers in the data in terms of publish time. To remove these lets filter by publish time. Just eye-balling the previous graph, it looks like the data starts in late 2017.
+
+```{r}
+filtered_df <- full_df %>%
+  filter(publish_time > as.POSIXct("2017-11-01"))
+filtered_df %>%
+  ggplot(mapping=aes(x=publish_time,y=views,color=category)) +
+  geom_point()
+```
+
+Through adjusting the filter time, I've found that the majority of the data is after November 1st, 2017. Now we have a better idea of the how the data is distributed. From this graph, we can see that a few videos have substantially more views than the vast majority of videos, which seem to have only a few views. This clearly shows that youtube videos can be described by a [pareto distribution](https://en.wikipedia.org/wiki/Pareto_distribution) in terms of view counts.
+
+This graph gives us a good idea of what the raw data looks like, however it doesn't show us a more nuanced view of the majority of the data points because most of them are of lower view counts. To better represent these data points, lets transform the above graph into a log graph to scale down the more extreme values.
+
+```{r}
+filtered_df %>%
+  ggplot(mapping=aes(x=publish_time,y=log(views),color=category)) +
+  geom_point()
+```
+
+I also am curious to see of this same log graph, what is the percentage of likes of all votes.
+
+```{r}
+filtered_df %>%
+  mutate(like_percentage=likes/(likes+dislikes)) %>%
+  ggplot(mapping=aes(x=publish_time,y=log(views),color=like_percentage)) +
+  geom_point()
+```
+
+So from this graph, we can see that there isnt a clear pattern between like percentage and view count. However, it seems as though maybe lower view count videos are generally more disliked.
+
+The next question I am curious about the answer to is: What is the average view count per video based on category. Let's use a bar graph to visualize this difference.
+
+```{r}
+filtered_df %>%
+  group_by(category_id) %>%
+  ggplot(mapping=aes(x=factor(category_id),y=log(views))) +
+  geom_violin()+
+  geom_hline(yintercept=mean(log(filtered_df$views)),color="red")
+```
+
+Although these boxplots look somewhat similar (excluding Nonprofits & Activism and Shows), you can see that a significant portion of the upper data points for Music videos are higher than the other categories. We can also see that Entertainment and Film & Animation are also high in view counts on average.
+
+Our last issue we need to explore before doing our Hypothesis Testing is how to deal with the string attributes like title, description and tags for the YouTube videos. To deal with string data, we will first tokenize the data into words. After tokenization, we will remove [syncategorematic words](https://en.wikipedia.org/wiki/Syncategorematic_term) because these will not be useful in our analysis. We will then tally how many times a categorematic word has been used, but this tally will be _weighted_ based on how many views the video has received. After this we will sort the words by their tally values and this sorted list will be used to rank future titles, descriptions and tags by how many (and _which_) "important" words they contain. This process will result in a _quantitative_ grading system for string attributes that will hopefully be useful in prediction/classification of viral videos.
+
+First lets tokenize all titles, descriptions, and tags.
+
+```{r}
+library(stringr)
+library(tidytext)
+title_df <- filtered_df %>%
+  unnest_tokens(word,title) %>%
+  mutate(like_percentage=likes/(likes+dislikes)) %>%
+  select(word,views,like_percentage) %>%
+  anti_join(get_stopwords(),by="word")
+description_df <- filtered_df %>%
+  unnest_tokens(word,description) %>%
+  mutate(like_percentage=likes/(likes+dislikes)) %>%
+  select(word,views,like_percentage) %>%
+  anti_join(get_stopwords(),by="word")
+tags_df <- filtered_df %>%
+  unnest_tokens(word,tags) %>%
+  mutate(like_percentage=likes/(likes+dislikes)) %>%
+  select(word,views,like_percentage) %>%
+  anti_join(get_stopwords(),by="word")
+words_df <- rbind(title_df,rbind(description_df,tags_df))
+words_df
+```
+
+Now that we have one data frame filled with words, and the view count and like percentage of the video they belonged to, we can group the data by word and average both the views and the like percentage.
+
+We also note that some values are encoded as NaN, exclude these from the mean calculations. 
+
+```{r}
+word_rank_df <- words_df %>%
+  group_by(word) %>%
+  summarize(avg_views=mean(views),avg_like_percentage=mean(like_percentage [! like_percentage %in% c(NaN)])) %>%
+  arrange(by=desc(avg_views))
+word_rank_df
+```
+
+Now that we have this table we can quickly look up what words will be successful. This allows us to predict that if a certain youtube video title has many "successful" aka highly ranked words, we can more quantitatively predict if the youtube video will be successful.
+
+Let's now make a function that grades strings based on how many high ranking words it contains. We will be able to use this function later on to grade prospective youtube video titles, descriptions, and tags to see if it will be successful.
+
+```{r}
+# Tokenize string, get number of views each word gets from word_rank_df (0 otherwise) and return average number of views
+grade_string <- function(string){
+  # Tokenize String
+  joined_df <- as.data.frame(string) %>% 
+    mutate(string=as.character(string)) %>%
+    unnest_tokens(word,string) %>%
+    anti_join(get_stopwords(), by="word") %>%
+    left_join(word_rank_df,by="word")
+  mean(joined_df$avg_views)
+}
+
+grade_string_likes <- function(string){
+  joined_df <- as.data.frame(string) %>% 
+    mutate(string=as.character(string)) %>%
+    unnest_tokens(word,string) %>%
+    anti_join(get_stopwords(), by="word") %>%
+    left_join(word_rank_df,by="word") 
+  mean(joined_df$avg_like_percentage)
+}
+```
+
+Now lets run grade_string() on every title in the full data set to grade all the titles.
+
+Running this function takes about 30 minutes, so I ran it once and saved the results in a file and just read the file. If you want to test the code yourself and have 30 mins to kill, just uncomment the commented section and comment the pipeline that would overwrite the grade_title variable that follows the commented section. It should reproduce the same output.
+
+```{r}
+#grade_title <- c()
+#for(i in 1:length(filtered_df$title)){
+#  grade_title[i] <- grade_string(filtered_df$title[i])
+#  print(i/length(filtered_df$title))
+#}
+#ind <- 1:length(filtered_df$title)
+#grade_title <- data.frame(grade_title,ind)
+grade_title <- read.csv("grade_title.csv") %>%
+  mutate(ind=1:length(grade_title)) %>%
+  rowwise() %>%
+  mutate(grade_title=as.numeric(strsplit(as.character(grade_title), "\\s+")[[1]][2]))
+graded_df <- filtered_df %>%
+  mutate(ind=1:length(title)) %>%
+  left_join(grade_title,by="ind") %>%
+  select(-ind)
+graded_df
+```
+
+Now that we have the graded strings data for title, lets graph to see if graded_title is correlated with actual views.
+
+```{r}
+graded_df %>%
+  ggplot(mapping=aes(x=log(grade_title),y=log(views))) +
+  geom_point() +
+  geom_smooth(method=lm)
+```
+
+It seems from the regression line above that there is somewhat of a good fit for the data. Lets look at the actual regression and see if it is significant
+
+```{r}
+fit <- lm(log(graded_df$views)~log(graded_df$grade_title))
+fit %>% tidy()
+```
+
+With a surprising p-value of 0, it seems as though there is a statistically valid relationship between the log of title grade and the log of the view count.
+
+```{r}
+filtered_df %>%
+  summarize(mean(views), median(views), sd(views), IQR(views))
+```
+
+Lastly, let's figure out which channels do better per average video. We'll do this by getting the average view count per video for each channel.
+
+```{r}
+channel_df <- graded_df %>%
+  group_by(channel_title) %>%
+  summarize(mean_views=mean(views)) %>%
+  arrange(by=desc(mean_views))
+channel_df
+```
+
+Now we have our average youtube video view count for each youtube channel. Unsurprisingly, most of the top youtube channels are entertainmenters / musicians.
+
+Now we can use this to somewhat predict the average video will get if it is found in the channel data frame. If it is not found in the data frame then we assign it the average view count for all youtube videos.
+
+```{r}
+graded_df <- graded_df %>%
+  left_join(channel_df,by="channel_title") %>%
+  rename(channel_grade = mean_views)
+graded_df %>%
+  ggplot(mapping=aes(x=log(channel_grade),y=log(views))) +
+  geom_point() +
+  geom_smooth(method=lm)
+```
+
+This graph shows us that the channel_grade attribute is highly closely associated with the views. Lets look at the actual regression values to see if they are statistically significant.
+
+This makes intuitive sense because youtube has a subscriber system where if you like a channel you can get updated when they release a new video. So if a channel is notorious, they are more likely to continue to get high view counts on their videos. 
+
+```{r}
+channel_fit <- lm(log(graded_df$views) ~ log(graded_df$channel_grade))
+channel_fit %>% tidy()
+```
+
+Again, with another p-value of zero we can say that there is a statistical relationship between the log of our channel grading and the log of the view count.
+
+Our analysis of this data will be predicting video virality and likability. This will require dividing the data into viral and non-viral. The mean of the data is 1,897,456 views and the median of the data is 566,453.5 views. For sake of simplicity, I will assert that a video is _viral_ if it has amassed at least 5,000,000 views.
+
+Let's complete our EDA with one last step of data cleaning. Let's remove all data except for predictors and outcome. As a reminder, the variables we are going to use to predict the outcome are title grade, channel grade, and category. The actual output variable will be whether or not the video is classified as _viral_ (1=viral,0=not viral).
+
+```{r}
+final_df <- graded_df %>%
+  mutate(viral=as.factor(ifelse(views>5000000,"viral","not viral")), category=as.factor(category)) %>%
+  select(title_grade=grade_title,category, viral)
+final_df <- final_df[complete.cases(final_df),] # remove all rows with any NA values
+final_df
+```
+
+## Hypothesis Testing / Machine Learning
+
+Now that we have a sense for what the data looks like, lets make a model to predict a YouTube video's success based on our predictors.
+
+We will use a Random Forest classifier to predict the virality of any youtube video and we will measure the affectiveness of this classifier using Cross-Validation.
+
+```{r}
+library(ISLR)
+library(cvTools)
+library(tree)
+library(tidyverse)
+library(caret)
+library(randomForest)
+
+
+# do final_full_df first
+result_df <- createFolds(final_df$viral, k=10) %>%
+  # fit models and gather results
+  purrr::imap(function(test_indices, fold_number) {
+    # split into train and test for the fold
+    train_df <- final_df %>%
+      slice(-test_indices)
+
+    test_df <- final_df %>%
+      slice(test_indices)
+  
+    # fit the model
+    rf1 <- randomForest(viral~., data=train_df, na.action = na.exclude)
+    
+    # gather results
+    test_df %>%
+      select(observed_label = viral) %>%
+      mutate(fold=fold_number) %>%
+      mutate(prob_positive_rf1 = predict(rf1, newdata=test_df, type="prob")[,"viral"]) %>%
+      # add predicted labels for rf1 using a 0.5 probability cutoff
+      mutate(predicted_label_rf1 = ifelse(prob_positive_rf1 > 0.5, "viral", "not viral"))
+}) %>%
+  # combine the five result data frames into one
+  purrr::reduce(bind_rows)
+result_df
+```
+
+Now that we have our results of the 10-fold Cross Validation, lets determine the error rate.
+
+```{r message=FALSE}
+error_df <- result_df %>%
+  mutate(error_rf1 = observed_label != predicted_label_rf1) %>%
+  group_by(fold) %>%
+  summarize(full_rf=mean(error_rf1)) %>%
+  tidyr::gather(model, error, -fold)
+error_df %>%
+  ggplot(mapping=aes(x=model,y=error)) +
+  geom_point()
+error_df
+```
+
+Finally, lets generate a ROC curve to measure the TPR and FPR, and then calculate AUROC for our model.
+
+```{r message=FALSE}
+library(ROCR)
+
+# create a list of true observed labels 
+labels_full <- split(result_df$observed_label, result_df$fold)
+
+# now create a list of predictions for the first RF and pass it to the ROCR::prediction function
+predictions_rf1 <- split(result_df$prob_positive_rf1, 
+                         result_df$fold) %>% prediction(labels_full)
+
+# compute average AUC for the first RF
+mean_auc_rf1 <- predictions_rf1 %>%
+  performance(measure="auc") %>%
+  # I know, this line is ugly, but that's how it is
+  slot("y.values") %>% unlist() %>% 
+  mean()
+
+# plot the ROC curve for the first RF
+predictions_rf1 %>%
+  performance(measure="tpr", x.measure="fpr") %>%
+  plot(avg="threshold", col="orange", lwd=2)
+
+# add a legend to the plot
+legend("bottomright",
+       legend=paste("AUC:",
+                    round(mean_auc_rf1, digits=3)),
+       col="orange")
+
+abline(a=0,b=1,col="red")
+```
+
+The ROC curve we created and its associated AUC value is very high! This means that our random forest classifier very accurately predicts the virality of youtube videos. 
+
+However there is an issue with our methodology. Because we trained our grading methods on the full dataset, our grading systems are somewhat already informed on how viral each word in the title, each channel and each category will be. I believe this bias is minor because 35,000 youtube videos is no small sample size and it pretty accurately represents the content of the website. Few videos get outrageously high view counts and most of the videos get very few. The sample of videos taken is an accurate portrayal and cross-section of the average youtube videos found on the site. 
+
+To further prove this, I took a youtube video that wasnt found in the data set downloaded, and entered the data manually and had a full-dataset random forest classifier accurately predict its virality. The video was [Ariana Grande - Break Free (Live on the Honda Stage at the iHeartRadio Theater LA)](https://www.youtube.com/watch?v=XVt80tm3L7Y) and had amassed 26 million views, therefore we consider it viral.
+
+```{r}
+rf <- randomForest(viral~., data=final_df, na.action = na.exclude)
+newData <- data.frame(6159803,76464566.3) %>% # These two numbers are the grade values of the title and channel
+  rename(title_grade=X6159803,channel_grade=X76464566.3)
+newData$viral <- factor("viral",levels=levels(final_df$viral))
+newData$category <- factor("Music", levels=levels(final_df$category))
+predict(rf,newData,type="response")
+```
+
+As we mentioned before and can see above, the random forest classifier correctly predicted the virality of the Ariana Grande music video that wasnt in the original data set. This shows the grading systems are relatively unbiased.
+
+## Insights learned during the tutorial
+
+In conclusion, we learned that youtube videos express a pareto distribution in terms of view counts. We learned that music is far and away the highest in view counts on average. We learned that the Music, Entertainment, and Film & Animation categories are on average higher in views than the other categories. We also learned that the channel that uploads a youtube video is _highly_ correlated with the views the video gets.
+
+After running cross-validation on our random forest classifier, we can say that the words in the title, the channel and the category are able to very accurately predict a youtube video's success. 
+
+If we had even more data on which title words were successful and more data on mean views per channel, then we would be able to accurately predict seemingly any future youtube video.
+
+Through this tutorial we learned how to curate, clean, prepare, visualize, run machine learning algorithms on and learn from data.
